@@ -40,6 +40,8 @@ type SQL struct {
 	TimestampColumn       string
 	TableTemplate         string
 	TableExistsTemplate   string
+	ColumnExistsTemplate  string
+	ColumnCreate          bool
 	InitSQL               string `toml:"init_sql"`
 	Convert               ConvertStruct
 	ConnectionMaxIdleTime config.Duration
@@ -47,9 +49,10 @@ type SQL struct {
 	ConnectionMaxIdle     int
 	ConnectionMaxOpen     int
 
-	db     *gosql.DB
-	Log    telegraf.Logger `toml:"-"`
-	tables map[string]bool
+	db      *gosql.DB
+	Log     telegraf.Logger `toml:"-"`
+	tables  map[string]bool
+	columns map[string]map[string]bool
 }
 
 func (*SQL) SampleConfig() string {
@@ -81,6 +84,7 @@ func (p *SQL) Connect() error {
 
 	p.db = db
 	p.tables = make(map[string]bool)
+	p.columns = make(map[string]map[string]bool)
 
 	return nil
 }
@@ -171,6 +175,10 @@ func (p *SQL) generateCreateTable(metric telegraf.Metric) string {
 	return query
 }
 
+func (p *SQL) generateColumnAlter(table string, column string, datatype string) string {
+	return fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", quoteIdent(table), quoteIdent(column), datatype)
+}
+
 func (p *SQL) generateInsert(tablename string, columns []string) string {
 	placeholders := make([]string, 0, len(columns))
 	quotedColumns := make([]string, 0, len(columns))
@@ -193,6 +201,14 @@ func (p *SQL) generateInsert(tablename string, columns []string) string {
 		quoteIdent(tablename),
 		strings.Join(quotedColumns, ","),
 		strings.Join(placeholders, ","))
+}
+
+func (p *SQL) columnExists(tableName string, columnName string) bool {
+	stmt := strings.ReplaceAll(p.ColumnExistsTemplate, "{TABLE}", tableName)
+	stmt = strings.ReplaceAll(stmt, "{COLUMN}", columnName)
+
+	_, err := p.db.Exec(stmt)
+	return err == nil
 }
 
 func (p *SQL) tableExists(tableName string) bool {
@@ -236,6 +252,29 @@ func (p *SQL) Write(metrics []telegraf.Metric) error {
 			values = append(values, value)
 		}
 
+		// check if all columns exist
+		if p.ColumnCreate {
+			for _, column := range columns {
+				if !p.columns[tablename][column] && !p.columnExists(tablename, column) {
+					// column does not exist, create it
+					datatype := p.deriveDatatype(metric.Fields()[column])
+					alterStmt := p.generateColumnAlter(tablename, column, datatype)
+					_, err := p.db.Exec(alterStmt)
+					if err != nil {
+						return err
+					}
+				}
+
+				// if this is the first time seing this table
+				if p.columns[tablename] == nil {
+					p.columns[tablename] = make(map[string]bool)
+				}
+
+				// mark column as existing
+				p.columns[tablename][column] = true
+			}
+		}
+
 		sql := p.generateInsert(tablename, columns)
 
 		switch p.Driver {
@@ -275,9 +314,11 @@ func init() {
 
 func newSQL() *SQL {
 	return &SQL{
-		TableTemplate:       "CREATE TABLE {TABLE}({COLUMNS})",
-		TableExistsTemplate: "SELECT 1 FROM {TABLE} LIMIT 1",
-		TimestampColumn:     "timestamp",
+		TableTemplate:        "CREATE TABLE {TABLE}({COLUMNS})",
+		TableExistsTemplate:  "SELECT 1 FROM {TABLE} LIMIT 1",
+		ColumnExistsTemplate: `SELECT {COLUMN} FROM {TABLE} LIMIT 1`,
+		ColumnCreate:         false,
+		TimestampColumn:      "timestamp",
 		Convert: ConvertStruct{
 			Integer:         "INT",
 			Real:            "DOUBLE",
